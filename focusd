@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+#
+# This file is part of efafocusd.
+#
+# efafocusd is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# efafocusd is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with efafocusd.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Daemon for controlling a Planewave focus controller via Pyro"""
+
+import argparse
+import datetime
+import queue
+import threading
+import time
+import traceback
+import sys
+import Pyro4
+from warwick.observatory.common import log
+from warwick.observatory.common.helpers import pyro_client_matches
+from warwick.observatory.efafocus import CommandStatus, Config, FocuserStatus
+from warwick.observatory.efafocus.efalib import EfaSession
+
+# Set automatically when generating RPM package
+SOFTWARE_VERSION = "UNKNOWN"
+
+class EFAFocusDaemon:
+    """Daemon interface for multi-channel focuser"""
+    def __init__(self, config):
+        self.wait_condition = threading.Condition()
+        self._config = config
+
+        self._state_lock = threading.Lock()
+        self._state_date = datetime.datetime.min
+        self._current_moving = False
+        self._current_steps = 0
+        self._target_steps = 0
+
+        self._comm_lock = threading.Lock()
+        self._command_queue = queue.Queue()
+        self._result_queue = queue.Queue()
+        self._move_complete_condition = threading.Condition()
+        self._session = None
+
+        threading.Thread(target=self.__run, daemon=True).start()
+
+    def _open_connection(self):
+        """
+        Opens the serial connection to the focuser.
+        Returns CommandStatus reflecting result
+        """
+        if self._session is not None:
+            return CommandStatus.NotDisconnected
+
+        try:
+            session = EfaSession(self._config.serial_port)
+            log.info(self._config.log_name, 'connected to controller')
+
+            with self._state_lock:
+                self._session = session
+
+            # Refresh state before considering the connection valid
+            ticks = self._session.getMotorPosition().parseData()
+
+            with self._state_lock:
+                self._state_date = datetime.datetime.utcnow()
+                self._target_steps = self._current_steps = ticks
+
+            return CommandStatus.Succeeded
+        except Exception as exception:
+            print(f'Failed to establish connection ({exception})')
+            if self._session is not None:
+                self._session.aux.close()
+                self._session = None
+
+            return CommandStatus.Failed
+
+    def _close_connection(self):
+        """
+        Closes the serial connection to the focuser.
+        Returns CommandStatus reflecting result
+        """
+        with self._state_lock:
+            if self._session is None:
+                return CommandStatus.NotConnected
+
+            try:
+                if self._session is not None:
+                    self._session.aux.close()
+                return CommandStatus.Succeeded
+            except Exception as exception:
+                print(f'Failed to close session ({exception})')
+                return CommandStatus.Failed
+            finally:
+                self._session = None
+
+    def process_request(self, request, data):
+        """
+        Process a command sent by the user
+        Returns a CommandStatus that is pushed to the results queue
+        """
+        if self._session is None:
+            return CommandStatus.NotConnected
+
+        # Only stop is valid when moving
+        if request != 'stop' and self._current_moving:
+            return CommandStatus.Blocked
+
+        if request == 'stop':
+            response = self._session.trackPositive(0).parseData()
+            self._target_steps = self._session.getMotorPosition().parseData()
+        elif request == 'zero':
+            response = self._session.setEncoder(0).parseData()
+        elif request in ['set', 'offset']:
+            if request == 'set':
+                self._target_steps = data
+            else:
+                self._target_steps += data
+            response = self._session.gotoPos2(self._target_steps).parseData()
+
+        else:
+            print(f'Unknown request `{request}`')
+            return CommandStatus.Failed
+
+        return CommandStatus.Succeeded if response == 1 else CommandStatus.Failed
+
+    def __run(self):
+        """Background thread managing communication over the serial connection"""
+        delay = self._config.idle_loop_delay
+        while True:
+            try:
+                request, data = self._command_queue.get(timeout=delay)
+            except queue.Empty:
+                request, data = None, None
+
+            if request == 'connect':
+                self._result_queue.put(self._open_connection())
+                continue
+
+            if request == 'disconnect':
+                self._result_queue.put(self._close_connection())
+                continue
+
+            result = CommandStatus.NotConnected
+            was_moving = self._current_moving
+            is_moving = False
+            try:
+                if request is not None:
+                    result = self.process_request(request, data)
+
+                # Refresh the state to ensure a valid view of the controller state before returning
+                if self._session is not None:
+                    # getMotorPosition may sometimes return None if it is near the end of a movement
+                    while True:
+                        pos = self._session.getMotorPosition()
+                        if pos is not None:
+                            ticks = pos.parseData()
+                            break
+                        time.sleep(0.1)
+
+                    is_moving = self._session.isGotoOver().parseData() == 0
+                    with self._state_lock:
+                        self._state_date = datetime.datetime.utcnow()
+                        self._current_steps = ticks
+                        self._current_moving = is_moving
+
+            except Exception as exception:
+                with self._state_lock:
+                    if self._session is not None:
+                        self._session.aux.close()
+                        self._session = None
+
+                print(f'Failed to read session ({exception})')
+                log.error(self._config.log_name, 'Lost serial connection')
+                traceback.print_exc(file=sys.stdout)
+            finally:
+                if request is not None:
+                    self._result_queue.put(result)
+
+                if was_moving and not is_moving:
+                    with self._move_complete_condition:
+                        self._move_complete_condition.notify_all()
+
+                delay = self._config.moving_loop_delay if is_moving else self._config.idle_loop_delay
+
+    @Pyro4.expose
+    def report_status(self):
+        """Returns a dictionary containing the current focuser state"""
+        with self._state_lock:
+            data = {
+                'date': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'software_version': SOFTWARE_VERSION
+            }
+
+            if self._session is not None:
+                data.update({
+                    'status': FocuserStatus.Moving if self._current_moving else FocuserStatus.Idle,
+                    'target_steps': self._target_steps,
+                    'current_steps': self._current_steps
+                })
+            else:
+                data['status'] = FocuserStatus.Disabled
+
+            return data
+
+    @Pyro4.expose
+    def set_focus(self, steps, offset=False):
+        """Request focuser to move a specific step position"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with self._comm_lock:
+            self._command_queue.put(('offset' if offset else 'set', steps))
+            result = self._result_queue.get()
+
+        if result != CommandStatus.Succeeded:
+            return result
+
+        start = datetime.datetime.utcnow()
+
+        while True:
+            with self._move_complete_condition:
+                self._move_complete_condition.wait(1)
+
+            if not self._current_moving:
+                break
+
+            if self._session is None:
+                return CommandStatus.Failed
+
+            if (datetime.datetime.utcnow() - start).total_seconds() > self._config.move_timeout:
+                return CommandStatus.Failed
+
+        return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def reset_home_position(self):
+        """Request focuser to reset its home position to its current position"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with self._comm_lock:
+            self._command_queue.put(('zero', None))
+            return self._result_queue.get()
+
+    @Pyro4.expose
+    def stop(self):
+        """Stop any in progress movement"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with self._comm_lock:
+            self._command_queue.put(('stop', None))
+            return self._result_queue.get()
+
+    @Pyro4.expose
+    def initialize(self):
+        """Connects to the focuser hardware"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with self._comm_lock:
+            self._command_queue.put(('connect', None))
+            return self._result_queue.get()
+
+    @Pyro4.expose
+    def shutdown(self):
+        """Disconnects from the focuser hardware"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with self._comm_lock:
+            self._command_queue.put(('disconnect', None))
+            return self._result_queue.get()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Focus Server')
+    parser.add_argument('config', help='Path to configuration json file')
+    args = parser.parse_args()
+    _config = Config(args.config)
+    _config.daemon.launch(EFAFocusDaemon(_config))

@@ -1,0 +1,9 @@
+{
+  "daemon": "halfmetre_focuser",
+  "log_name": "focusd@halfmetre",
+  "control_machines": ["HalfMetreTCS"],
+  "serial_port": "/dev/focuser",
+  "idle_loop_delay": 5,
+  "moving_loop_delay": 0.5,
+  "move_timeout": 180
+}
