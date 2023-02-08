@@ -66,12 +66,17 @@ def print_status(config, _):
         date = datetime.datetime.strptime(data['date'], '%Y-%m-%dT%H:%M:%SZ')
         print('Data received ' + TFmt.Bold + str(date) + TFmt.Clear + ':')
         status = data['status']
-        print('  Status: ' + FocuserStatus.label(status, True))
+        print('   Status: ' + FocuserStatus.label(status, True))
         if status < FocuserStatus.Idle:
             return 0
 
-        print(f'Position: {TFmt.Bold}{data["current_steps"]:+07d}{TFmt.Clear} steps{TFmt.Clear}')
-        print(f'  Target: {TFmt.Bold}{data["target_steps"]:+07d}{TFmt.Clear} steps{TFmt.Clear}')
+        print(f' Position: {TFmt.Bold}{data["current_steps"]:07d}{TFmt.Clear} steps{TFmt.Clear}')
+        print(f'   Target: {TFmt.Bold}{data["target_steps"]:07d}{TFmt.Clear} steps{TFmt.Clear}')
+        if data["primary_temperature"] is not None:
+            print(f'Pri. Temp: {TFmt.Bold}{data["primary_temperature"]:.1f}{TFmt.Clear}\u00B0C')
+        if data["ambient_temperature"] is not None:
+            print(f'Amb. Temp: {TFmt.Bold}{data["ambient_temperature"]:.1f}{TFmt.Clear}\u00B0C')
+        print(f' OTA Fans: {TFmt.Bold}{"ENABLED" if data["fans_enabled"] else "DISABLED"}{TFmt.Clear}')
     return 0
 
 
@@ -133,6 +138,16 @@ def set_home_position(config, _):
         return focusd.reset_home_position()
 
 
+def enable_fans(config, args):
+    """Enable or disable OTA fans"""
+    if len(args) == 1 and args[0] in ['enable', 'disable']:
+        with config.daemon.connect() as focusd:
+            return focusd.enable_fans(args[0] == 'enable')
+
+    print(f'usage: {SCRIPT_NAME} offset <step delta>')
+    return -1
+
+
 def initialize(config, _):
     """Connect to the focuser"""
     with config.daemon.connect() as focusd:
@@ -172,6 +187,7 @@ if __name__ == '__main__':
         'status': print_status,
         'json': print_json,
         'zero': set_home_position,
+        'fans': enable_fans,
         'init': initialize,
         'kill': shutdown
     }

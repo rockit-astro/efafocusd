@@ -1,5 +1,5 @@
 Name:      observatory-efafocus-server
-Version:   20230205
+Version:   20230208
 Release:   0
 Url:       https://github.com/warwick-one-metre/efafocusd
 Summary:   Planewave focuser control server.

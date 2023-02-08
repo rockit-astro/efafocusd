@@ -44,6 +44,9 @@ class EFAFocusDaemon:
         self._current_moving = False
         self._current_steps = 0
         self._target_steps = 0
+        self._primary_temperature = None
+        self._ambient_temperature = None
+        self._fans_enabled = False
 
         self._comm_lock = threading.Lock()
         self._command_queue = queue.Queue()
@@ -111,6 +114,10 @@ class EFAFocusDaemon:
         if self._session is None:
             return CommandStatus.NotConnected
 
+        if request == 'fans':
+            response = self._session.setFanState(data).parseData()
+            return CommandStatus.Succeeded if response == 1 else CommandStatus.Failed
+
         # Only stop is valid when moving
         if request != 'stop' and self._current_moving:
             return CommandStatus.Blocked
@@ -168,10 +175,17 @@ class EFAFocusDaemon:
                         time.sleep(0.1)
 
                     is_moving = self._session.isGotoOver().parseData() == 0
+                    primary_temperature = self._session.getTemperature(0)
+                    ambient_temperature = self._session.getTemperature(1)
+                    fans_enabled = self._session.getFanState().parseData() == 0
+
                     with self._state_lock:
                         self._state_date = datetime.datetime.utcnow()
                         self._current_steps = ticks
                         self._current_moving = is_moving
+                        self._primary_temperature = primary_temperature
+                        self._ambient_temperature = ambient_temperature
+                        self._fans_enabled = fans_enabled
 
             except Exception as exception:
                 with self._state_lock:
@@ -205,7 +219,10 @@ class EFAFocusDaemon:
                 data.update({
                     'status': FocuserStatus.Moving if self._current_moving else FocuserStatus.Idle,
                     'target_steps': self._target_steps,
-                    'current_steps': self._current_steps
+                    'current_steps': self._current_steps,
+                    'primary_temperature': self._primary_temperature,
+                    'ambient_temperature': self._ambient_temperature,
+                    'fans_enabled': self._fans_enabled
                 })
             else:
                 data['status'] = FocuserStatus.Disabled
@@ -250,6 +267,16 @@ class EFAFocusDaemon:
 
         with self._comm_lock:
             self._command_queue.put(('zero', None))
+            return self._result_queue.get()
+
+    @Pyro4.expose
+    def enable_fans(self, enabled):
+        """Turn OTA fans on or off"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with self._comm_lock:
+            self._command_queue.put(('fans', enabled))
             return self._result_queue.get()
 
     @Pyro4.expose
